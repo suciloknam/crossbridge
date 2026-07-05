@@ -1,0 +1,317 @@
+# .github/workflows/ci-cd.yml
+
+name: CrossBridge Multi-Cloud CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+    branches: [main]
+
+env:
+  # Azure
+  ACR_NAME: crossbridgeacr
+  AKS_CLUSTER: crossbridge-aks
+  RESOURCE_GROUP: crossbridge-rg
+  # AWS
+  ECR_REGISTRY: <account-id>.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPO: crossbridge-api
+  ECS_UAT_CLUSTER: crossbridge-uat
+  ECS_PROD_CLUSTER: crossbridge-prod
+  ECS_SERVICE: crossbridge-svc
+  # Shared
+  IMAGE_NAME: crossbridge-api
+
+jobs:
+
+# ──────────────────────────────────────────
+# JOB 1: Build → Scan → Push ACR + ECR
+# ──────────────────────────────────────────
+  ci:
+    name: Build Test Scan Push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # Required for OIDC
+      contents: read
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build and test
+        run: mvn verify
+
+      - name: Set image tag (git SHA)
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }} \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }} \
+            .
+
+      - name: Trivy security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          exit-code: '1'
+          severity: 'CRITICAL'
+          # Pipeline FAILS if critical CVEs found
+          # Fix your base image before proceeding
+
+      # ── Push to ACR (Azure) ──
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push to ACR
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+
+      # ── Push to ECR (AWS) ──
+      - name: AWS OIDC Login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Push to ECR
+        run: |
+          aws ecr get-login-password | \
+            docker login --username AWS \
+              --password-stdin ${{ env.ECR_REGISTRY }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}
+
+
+# ──────────────────────────────────────────
+# JOB 2 + 3: Deploy UAT — Parallel
+# ──────────────────────────────────────────
+
+  deploy-uat-azure:
+    name: Deploy UAT → Azure AKS
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    environment: UAT-Azure
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --name ${{ env.AKS_CLUSTER }} \
+            --resource-group ${{ env.RESOURCE_GROUP }}
+
+      - name: Deploy to AKS UAT namespace
+        run: |
+          kubectl apply -f k8s/uat/
+          kubectl set image deployment/crossbridge-api \
+            crossbridge-api=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ needs.ci.outputs.image-tag }} \
+            --namespace crossbridge-uat
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/crossbridge-api \
+            --namespace crossbridge-uat \
+            --timeout=300s
+
+      - name: Smoke test AKS UAT
+        run: |
+          UAT_IP=$(kubectl get svc crossbridge-svc \
+            --namespace crossbridge-uat \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          curl --fail --retry 5 http://$UAT_IP:8080/health
+          echo "AKS UAT smoke test passed"
+
+  # ─────────────────────────────────────────
+  deploy-uat-aws:
+    name: Deploy UAT → AWS ECS Fargate
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    environment: UAT-AWS
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AWS OIDC Login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Register new ECS task definition
+        id: task-def
+        run: |
+          # Inject new image tag into task definition
+          NEW_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ needs.ci.outputs.image-tag }}"
+          sed "s|IMAGE_PLACEHOLDER|$NEW_IMAGE|g" \
+            ecs/uat/task-definition.json > /tmp/task-def-uat.json
+
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/task-def-uat.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS UAT
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_UAT_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.task-def.outputs.task-def-arn }} \
+            --force-new-deployment
+
+      - name: Wait for ECS stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_UAT_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+
+      - name: Smoke test ECS UAT
+        run: |
+          ECS_URL=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_UAT_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].loadBalancers[0].dnsName' \
+            --output text)
+          curl --fail --retry 5 http://$ECS_URL/health
+          echo "ECS UAT smoke test passed"
+
+
+# ──────────────────────────────────────────
+# JOB 4 + 5: Deploy PROD — Parallel
+# Both UAT jobs must pass before PROD starts
+# ──────────────────────────────────────────
+
+  deploy-prod-azure:
+    name: Deploy PROD → Azure AKS
+    runs-on: ubuntu-latest
+    needs: [deploy-uat-azure, deploy-uat-aws]   # BOTH UAT must pass
+    environment: PROD-Azure                      # Approval gate
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --name ${{ env.AKS_CLUSTER }} \
+            --resource-group ${{ env.RESOURCE_GROUP }}
+
+      - name: Deploy to AKS PROD namespace
+        run: |
+          kubectl apply -f k8s/prod/
+          kubectl set image deployment/crossbridge-api \
+            crossbridge-api=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ needs.ci.outputs.image-tag }} \
+            --namespace crossbridge-prod
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/crossbridge-api \
+            --namespace crossbridge-prod \
+            --timeout=300s
+
+      - name: Smoke test AKS PROD
+        run: |
+          PROD_IP=$(kubectl get svc crossbridge-svc \
+            --namespace crossbridge-prod \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          curl --fail http://$PROD_IP:8080/health
+          echo "AKS PROD smoke test passed"
+
+  # ─────────────────────────────────────────
+  deploy-prod-aws:
+    name: Deploy PROD → AWS ECS Fargate
+    runs-on: ubuntu-latest
+    needs: [deploy-uat-azure, deploy-uat-aws]   # BOTH UAT must pass
+    environment: PROD-AWS                        # Approval gate
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AWS OIDC Login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Register new ECS task definition
+        id: task-def
+        run: |
+          NEW_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ needs.ci.outputs.image-tag }}"
+          sed "s|IMAGE_PLACEHOLDER|$NEW_IMAGE|g" \
+            ecs/prod/task-definition.json > /tmp/task-def-prod.json
+
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/task-def-prod.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS PROD
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_PROD_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.task-def.outputs.task-def-arn }} \
+            --force-new-deployment
+
+      - name: Wait for ECS stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_PROD_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+
+      - name: Smoke test ECS PROD
+        run: |
+          ECS_URL=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_PROD_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].loadBalancers[0].dnsName' \
+            --output text)
+          curl --fail http://$ECS_URL/health
+          echo "ECS PROD smoke test passed"
