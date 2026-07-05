@@ -3,10 +3,10 @@
 name: CrossBridge Multi-Cloud CI/CD
 
 on:
-  push:
-    branches: [main]
+#  push:
+#    branches: [main]
     paths-ignore: ['**.md']
-  pull_request:
+#   pull_request:
     branches: [main]
 
 env:
