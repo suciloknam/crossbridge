@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crossbridge-api
+  namespace: crossbridge-uat
+  labels:
+    app: crossbridge-api
+    environment: uat
+spec:
+  replicas: 1                          # UAT = 1 replica (cost saving)
+  selector:
+    matchLabels:
+      app: crossbridge-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0                # Never have zero pods during update
+      maxSurge: 1                      # Spin up new pod before killing old one
+  template:
+    metadata:
+      labels:
+        app: crossbridge-api
+        environment: uat
+    spec:
+      containers:
+        - name: crossbridge-api
+          # Image tag is injected by pipeline via kubectl set image
+          # This acts as a placeholder — pipeline replaces it
+          image: crossbridgeacr.azurecr.io/crossbridge-api:latest
+          ports:
+            - containerPort: 8080
+
+          # Read environment config from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: crossbridge-config
+
+          # Resource limits — CRITICAL for shared single node AKS
+          # Without limits, one pod can starve others
+          # You've debugged OOM kills at Sahaj — this prevents that
+          resources:
+            requests:
+              memory: "256Mi"          # Guaranteed allocation
+              cpu: "250m"              # 0.25 CPU guaranteed
+            limits:
+              memory: "512Mi"          # Hard ceiling — OOM kill if exceeded
+              cpu: "500m"              # Throttled if exceeded
+
+          # Liveness probe — is the app alive?
+          # Kubernetes restarts container if this fails 3 times
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30    # Give Spring Boot time to start
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Readiness probe — is the app ready for traffic?
+          # Pod removed from load balancer if this fails
+          # Traffic never hits a pod that isn't ready
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 3
