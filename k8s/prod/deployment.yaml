@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crossbridge-api
+  namespace: crossbridge-prod
+  labels:
+    app: crossbridge-api
+    environment: prod
+spec:
+  replicas: 2                          # PROD = 2 replicas (HA)
+  selector:
+    matchLabels:
+      app: crossbridge-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0                # Zero downtime deployment
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: crossbridge-api
+        environment: prod
+    spec:
+      containers:
+        - name: crossbridge-api
+          image: crossbridgeacr.azurecr.io/crossbridge-api:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: crossbridge-config
+          resources:
+            requests:
+              memory: "512Mi"          # PROD gets more guaranteed resources
+              cpu: "500m"
+            limits:
+              memory: "768Mi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 3
