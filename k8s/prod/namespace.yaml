@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crossbridge-prod
+  labels:
+    environment: prod
+    project: crossbridge
