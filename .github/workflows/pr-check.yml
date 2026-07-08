@@ -1,0 +1,47 @@
+# Runs on every PR raised against main
+# Build + test ONLY — no deployment
+# Untrusted code should never trigger deployments
+# This is the security boundary from Lesson 5
+
+name: PR Validation
+
+# on:
+#  pull_request:
+#    branches: [main]
+
+jobs:
+  validate:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    # No id-token: write permission here
+    # This job cannot authenticate to Azure or AWS
+    # Even if someone adds a malicious step — no credentials available
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build and run tests
+        run: mvn verify
+
+      - name: Build Docker image (verify it builds)
+        run: docker build -t crossbridge-pr-check .
+        # Don't push — just verify Dockerfile is valid
+        # No registry credentials needed or available
+
+      - name: Trivy scan PR image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: crossbridge-pr-check
+          exit-code: '1'
+          severity: 'CRITICAL'
+          # Block PR merge if critical CVEs in image
