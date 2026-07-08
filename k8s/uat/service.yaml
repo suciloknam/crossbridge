@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: crossbridge-svc
+  namespace: crossbridge-uat
+spec:
+  # LoadBalancer creates Azure Load Balancer automatically
+  # Gives you a public IP to hit from pipeline smoke test
+  # In production you'd use Ingress instead — but for portfolio this is fine
+  type: LoadBalancer
+  selector:
+    app: crossbridge-api
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
