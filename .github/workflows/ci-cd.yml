@@ -1,13 +1,9 @@
-# .github/workflows/ci-cd.yml
-
 name: CrossBridge Multi-Cloud CI/CD
 
 on:
-#  push:
-#    branches: [main]
-    paths-ignore: ['**.md']
-#   pull_request:
+  push:
     branches: [main]
+    paths-ignore: ['**.md']
 
 env:
   # Azure
@@ -15,7 +11,7 @@ env:
   AKS_CLUSTER: crossbridge-aks
   RESOURCE_GROUP: crossbridge-rg
   # AWS
-  ECR_REGISTRY: <account-id>.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REGISTRY: 503775269438.dkr.ecr.us-east-1.amazonaws.com
   ECR_REPO: crossbridge-api
   ECS_UAT_CLUSTER: crossbridge-uat
   ECS_PROD_CLUSTER: crossbridge-prod
@@ -32,7 +28,7 @@ jobs:
     name: Build Test Scan Push
     runs-on: ubuntu-latest
     permissions:
-      id-token: write        # Required for OIDC
+      id-token: write
       contents: read
     outputs:
       image-tag: ${{ steps.meta.outputs.tag }}
@@ -68,10 +64,7 @@ jobs:
           image-ref: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
           exit-code: '1'
           severity: 'CRITICAL'
-          # Pipeline FAILS if critical CVEs found
-          # Fix your base image before proceeding
 
-      # ── Push to ACR (Azure) ──
       - name: Azure OIDC Login
         uses: azure/login@v2
         with:
@@ -84,7 +77,6 @@ jobs:
           az acr login --name ${{ env.ACR_NAME }}
           docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
 
-      # ── Push to ECR (AWS) ──
       - name: AWS OIDC Login
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -93,16 +85,14 @@ jobs:
 
       - name: Push to ECR
         run: |
-          aws ecr get-login-password | \
+          aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS \
               --password-stdin ${{ env.ECR_REGISTRY }}
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}
 
-
 # ──────────────────────────────────────────
 # JOB 2 + 3: Deploy UAT — Parallel
 # ──────────────────────────────────────────
-
   deploy-uat-azure:
     name: Deploy UAT → Azure AKS
     runs-on: ubuntu-latest
@@ -147,10 +137,9 @@ jobs:
           UAT_IP=$(kubectl get svc crossbridge-svc \
             --namespace crossbridge-uat \
             -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          curl --fail --retry 5 http://$UAT_IP:8080/health
+          curl --fail --retry 5 --retry-delay 10 http://$UAT_IP:8080/health
           echo "AKS UAT smoke test passed"
 
-  # ─────────────────────────────────────────
   deploy-uat-aws:
     name: Deploy UAT → AWS ECS Fargate
     runs-on: ubuntu-latest
@@ -173,11 +162,9 @@ jobs:
       - name: Register new ECS task definition
         id: task-def
         run: |
-          # Inject new image tag into task definition
           NEW_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ needs.ci.outputs.image-tag }}"
           sed "s|IMAGE_PLACEHOLDER|$NEW_IMAGE|g" \
             ecs/uat/task-definition.json > /tmp/task-def-uat.json
-
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file:///tmp/task-def-uat.json \
             --query 'taskDefinition.taskDefinitionArn' \
@@ -190,6 +177,7 @@ jobs:
             --cluster ${{ env.ECS_UAT_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
             --task-definition ${{ steps.task-def.outputs.task-def-arn }} \
+            --desired-count 1 \
             --force-new-deployment
 
       - name: Wait for ECS stability
@@ -200,25 +188,32 @@ jobs:
 
       - name: Smoke test ECS UAT
         run: |
-          ECS_URL=$(aws ecs describe-services \
+          TASK_ARN=$(aws ecs list-tasks \
             --cluster ${{ env.ECS_UAT_CLUSTER }} \
-            --services ${{ env.ECS_SERVICE }} \
-            --query 'services[0].loadBalancers[0].dnsName' \
+            --service-name ${{ env.ECS_SERVICE }} \
+            --query 'taskArns[0]' \
             --output text)
-          curl --fail --retry 5 http://$ECS_URL/health
+          ENI_ID=$(aws ecs describe-tasks \
+            --cluster ${{ env.ECS_UAT_CLUSTER }} \
+            --tasks $TASK_ARN \
+            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+            --output text)
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids $ENI_ID \
+            --query 'NetworkInterfaces[0].Association.PublicIp' \
+            --output text)
+          echo "ECS UAT IP: $PUBLIC_IP"
+          curl --fail --retry 5 --retry-delay 10 http://$PUBLIC_IP:8080/health
           echo "ECS UAT smoke test passed"
-
 
 # ──────────────────────────────────────────
 # JOB 4 + 5: Deploy PROD — Parallel
-# Both UAT jobs must pass before PROD starts
 # ──────────────────────────────────────────
-
   deploy-prod-azure:
     name: Deploy PROD → Azure AKS
     runs-on: ubuntu-latest
-    needs: [deploy-uat-azure, deploy-uat-aws]   # BOTH UAT must pass
-    environment: PROD-Azure                      # Approval gate
+    needs: [deploy-uat-azure, deploy-uat-aws]
+    environment: PROD-Azure
     permissions:
       id-token: write
       contents: read
@@ -257,15 +252,14 @@ jobs:
           PROD_IP=$(kubectl get svc crossbridge-svc \
             --namespace crossbridge-prod \
             -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          curl --fail http://$PROD_IP:8080/health
+          curl --fail --retry 5 --retry-delay 10 http://$PROD_IP:8080/health
           echo "AKS PROD smoke test passed"
 
-  # ─────────────────────────────────────────
   deploy-prod-aws:
     name: Deploy PROD → AWS ECS Fargate
     runs-on: ubuntu-latest
-    needs: [deploy-uat-azure, deploy-uat-aws]   # BOTH UAT must pass
-    environment: PROD-AWS                        # Approval gate
+    needs: [deploy-uat-azure, deploy-uat-aws]
+    environment: PROD-AWS
     permissions:
       id-token: write
       contents: read
@@ -285,7 +279,6 @@ jobs:
           NEW_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ needs.ci.outputs.image-tag }}"
           sed "s|IMAGE_PLACEHOLDER|$NEW_IMAGE|g" \
             ecs/prod/task-definition.json > /tmp/task-def-prod.json
-
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file:///tmp/task-def-prod.json \
             --query 'taskDefinition.taskDefinitionArn' \
@@ -298,6 +291,7 @@ jobs:
             --cluster ${{ env.ECS_PROD_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
             --task-definition ${{ steps.task-def.outputs.task-def-arn }} \
+            --desired-count 1 \
             --force-new-deployment
 
       - name: Wait for ECS stability
@@ -308,10 +302,20 @@ jobs:
 
       - name: Smoke test ECS PROD
         run: |
-          ECS_URL=$(aws ecs describe-services \
+          TASK_ARN=$(aws ecs list-tasks \
             --cluster ${{ env.ECS_PROD_CLUSTER }} \
-            --services ${{ env.ECS_SERVICE }} \
-            --query 'services[0].loadBalancers[0].dnsName' \
+            --service-name ${{ env.ECS_SERVICE }} \
+            --query 'taskArns[0]' \
             --output text)
-          curl --fail http://$ECS_URL/health
+          ENI_ID=$(aws ecs describe-tasks \
+            --cluster ${{ env.ECS_PROD_CLUSTER }} \
+            --tasks $TASK_ARN \
+            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+            --output text)
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids $ENI_ID \
+            --query 'NetworkInterfaces[0].Association.PublicIp' \
+            --output text)
+          echo "ECS PROD IP: $PUBLIC_IP"
+          curl --fail --retry 5 --retry-delay 10 http://$PUBLIC_IP:8080/health
           echo "ECS PROD smoke test passed"
